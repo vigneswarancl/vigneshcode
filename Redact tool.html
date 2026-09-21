@@ -1,0 +1,1346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  ============================================================================
+  SecureRedact: client-side PDF redaction for Vigneswaran C L
+  ============================================================================
+  PRIVACY MODEL
+  * Every byte of the PDF stays in this browser tab. There is no upload code.
+  * The Content-Security-Policy below enforces that: connect-src 'none' blocks
+    fetch/XHR/WebSocket/beacon, so even a compromised script cannot send data
+    out. Scripts may load only from cdnjs (the three libraries).
+  * For air-gapped use, download the three library files once, place them next
+    to this file, change the <script src> paths, and remove cdnjs from the CSP.
+
+  SECURITY NOTE
+  * pdf.js 3.11.174 is affected by CVE-2024-4367 (font eval -> arbitrary JS)
+    unless isEvalSupported is false. Every getDocument() call below sets it to
+    false, and the CSP (no 'unsafe-eval') blocks eval as a second layer.
+
+  HOW REDACTION IS MADE PERMANENT
+  * Marked pages are rendered to a bitmap, black rectangles are painted INTO
+    the bitmap, and a brand-new PDF is built from those images with pdf-lib.
+    The original text operators, fonts, hidden layers, annotations, form data,
+    attachments and metadata of a flattened page are never copied, so nothing
+    under a black box can be selected, searched or extracted.
+  * The output document is created from scratch, so the source's document-level
+    metadata (author, title, XMP, JavaScript, attachments) is dropped too.
+  ============================================================================
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'unsafe-inline'; img-src data: blob:; font-src data: blob:; worker-src blob:; connect-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<title>SecureRedact | Vigneswaran C L</title>
+<style>
+  :root{
+    --ink:#13233d; --ink2:#1a2d4c; --ink3:#233a5f; --line:rgba(255,255,255,.09);
+    --tx:#e9eef5; --mut:#93a3bb; --brass:#c79a3b; --brass2:#dcb45c;
+    --paper:#d9dee5; --ok:#3fbf8f; --bad:#e5645d;
+    --ui:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,Roboto,"Helvetica Neue",Arial,sans-serif;
+    --id:"Cascadia Mono",Consolas,"SF Mono",Menlo,ui-monospace,monospace;
+  }
+  *{box-sizing:border-box}
+  [hidden]{display:none!important}
+  html,body{height:100%;margin:0}
+  body{font:13px/1.5 var(--ui);color:var(--tx);background:var(--ink)}
+  button,select,input{font-family:inherit}
+  :focus-visible{outline:2px solid var(--brass2);outline-offset:2px}
+
+  .app{display:grid;grid-template-columns:344px 1fr;height:100vh}
+
+  /* ---------------- Sidebar ---------------- */
+  .sidebar{display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--line)}
+  .brand{display:flex;gap:12px;align-items:center;padding:18px 20px 12px}
+  .brand svg{flex:none}
+  .brand-name{font-size:16px;font-weight:650;letter-spacing:.1px}
+  .brand-sub{font-size:11.5px;color:var(--mut)}
+  .local{margin:0 20px 6px;padding:8px 10px;border-radius:8px;font-size:12px;color:#bfeedd;
+         background:rgba(63,191,143,.08);border:1px solid rgba(63,191,143,.25);display:flex;gap:9px;align-items:center}
+  .local i{width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none;box-shadow:0 0 0 3px rgba(63,191,143,.18)}
+  .side-scroll{flex:1;overflow:auto;padding:0 20px 28px}
+  .step{padding:16px 0;border-bottom:1px solid var(--line)}
+  .step:last-child{border-bottom:0}
+  .step h3{margin:0 0 12px;font-size:14px;font-weight:600;display:flex;align-items:center;gap:9px}
+  .step h3 .n{width:22px;height:22px;border-radius:50%;border:1px solid var(--brass);color:var(--brass2);
+              display:grid;place-items:center;font-size:11.5px;font-weight:600}
+  .step h3 .count{margin-left:auto;font-size:12px;font-weight:500;color:var(--mut);font-variant-numeric:tabular-nums}
+  .hint{margin:0 0 10px;color:var(--mut);font-size:12px}
+
+  .drop{display:flex;flex-direction:column;align-items:center;gap:2px;padding:18px 12px;border-radius:10px;cursor:pointer;
+        border:1.5px dashed rgba(255,255,255,.2);transition:border-color .15s,background .15s;text-align:center}
+  .drop:hover,.drop.over{border-color:var(--brass);background:rgba(199,154,59,.07)}
+  .drop strong{font-size:13.5px;font-weight:600}
+  .drop span{color:var(--mut);font-size:12px}
+  .file-meta{margin-top:10px;padding:9px 11px;border-radius:8px;background:var(--ink2);font-size:12px;word-break:break-word}
+  .file-meta b{font-weight:600}
+
+  .row{display:grid;grid-template-columns:86px 1fr;align-items:center;gap:8px;margin-bottom:8px}
+  .row label{color:var(--mut);font-size:12px}
+  select,input[type=text]{width:100%;background:var(--ink2);color:var(--tx);border:1px solid var(--line);border-radius:7px;padding:7px 9px;font-size:13px}
+  input[type=checkbox]{accent-color:var(--brass);margin:0}
+
+  .cat-grid{display:grid;grid-template-columns:1fr 1fr;gap:2px 10px;margin:10px 0 14px}
+  .cat-grid label{display:flex;align-items:center;gap:7px;font-size:12.5px;cursor:pointer;padding:3px 0}
+  .sw{width:10px;height:10px;border-radius:2px;background:var(--c);flex:none}
+
+  .kw label.lbl{display:block;font-size:12px;color:var(--mut);margin-bottom:6px}
+  .kw-input{display:flex;gap:6px}
+  .kw-input button{flex:none;padding:0 12px;border-radius:7px;border:1px solid var(--line);background:var(--ink3);color:var(--tx);cursor:pointer}
+  .chips{margin:4px 0 14px}
+  .chip{display:inline-flex;align-items:center;gap:4px;margin:6px 6px 0 0;padding:2px 4px 2px 10px;border-radius:999px;font-size:12px;
+        background:rgba(168,85,247,.14);border:1px solid rgba(168,85,247,.38);color:#ecdcff;max-width:100%}
+  .chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .chip button{background:none;border:0;color:inherit;cursor:pointer;font-size:15px;line-height:1;padding:0 4px}
+
+  .btn{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--brass);background:var(--brass);color:#1d1606;
+       font-size:13px;font-weight:600;cursor:pointer;transition:background .15s}
+  .btn:hover:not(:disabled){background:var(--brass2)}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .progress{height:4px;border-radius:4px;background:var(--ink3);margin-top:10px;overflow:hidden}
+  .progress div{height:100%;width:0;background:var(--brass);transition:width .12s}
+
+  .check{display:flex;gap:9px;align-items:flex-start;font-size:12.5px;margin:8px 0;cursor:pointer}
+  .check input{margin-top:3px}
+  .check em{color:var(--mut);font-style:normal}
+
+  .findings .empty{color:var(--mut);font-size:12px;padding:6px 0}
+  .note{font-size:12px;padding:8px 10px;border-radius:8px;margin-bottom:8px;background:rgba(229,100,93,.09);border:1px solid rgba(229,100,93,.3);color:#ffd6d3}
+  .grp{border:1px solid var(--line);border-radius:8px;margin-bottom:6px;background:var(--ink2)}
+  .grp-head{display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;user-select:none}
+  .grp-head .gl{flex:1}
+  .gc{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums}
+  .chev{color:var(--mut);transition:transform .15s;font-size:11px}
+  .grp.open .chev{transform:rotate(90deg)}
+  .grp ul{display:none;list-style:none;margin:0;padding:0 6px 6px;max-height:230px;overflow:auto}
+  .grp.open ul{display:block}
+  .grp li{display:flex;align-items:center;gap:8px;padding:4px 5px;border-radius:5px}
+  .grp li:hover{background:var(--ink3)}
+  .grp li .pg{color:var(--mut);font-size:11.5px;width:34px;flex:none}
+  .grp li code{flex:1;font:11.5px var(--id);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+  .switch{position:relative;width:28px;height:16px;flex:none}
+  .switch input{position:absolute;opacity:0;width:0;height:0}
+  .switch span{position:absolute;inset:0;border-radius:999px;background:#3a4d6d;cursor:pointer;transition:background .15s}
+  .switch span::after{content:"";position:absolute;left:2px;top:2px;width:12px;height:12px;border-radius:50%;background:#fff;transition:transform .15s}
+  .switch input:checked+span{background:var(--brass)}
+  .switch input:checked+span::after{transform:translateX(12px)}
+  .switch input:focus-visible+span{outline:2px solid var(--brass2);outline-offset:2px}
+
+  .report{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:12px;background:rgba(63,191,143,.08);border:1px solid rgba(63,191,143,.28)}
+  .report.warn{background:rgba(229,100,93,.09);border-color:rgba(229,100,93,.35)}
+  .report strong{font-size:13px}
+
+  /* ---------------- Viewer ---------------- */
+  .main{display:flex;flex-direction:column;min-width:0;background:var(--paper);color:#1d2939}
+  .toolbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;background:#eef1f5;border-bottom:1px solid #c6ced9}
+  .tb{display:flex;align-items:center;gap:6px}
+  .tool{background:#fff;border:1px solid #c6ced9;border-radius:7px;padding:6px 11px;font-size:12.5px;font-weight:500;color:#1d2939;cursor:pointer}
+  .tool:hover:not(:disabled){border-color:#8d9ab0}
+  .tool.active{background:var(--ink);border-color:var(--ink);color:#fff}
+  .tool:disabled{opacity:.45;cursor:not-allowed}
+  #zoomLabel{min-width:46px;text-align:center;font-variant-numeric:tabular-nums;font-size:12.5px}
+  #pageInfo{font-size:12.5px;color:#56657c;margin-right:4px}
+  kbd{font:10.5px var(--id);border:1px solid currentColor;border-radius:4px;padding:0 4px;opacity:.55;margin-left:4px}
+
+  .viewer{flex:1;overflow:auto;position:relative}
+  #pages{display:flex;flex-direction:column;align-items:center;gap:26px;padding:30px 24px 70px}
+  .page{position:relative;background:#fff;box-shadow:0 1px 2px rgba(19,35,61,.14),0 10px 28px rgba(19,35,61,.10)}
+  .page canvas{display:block}
+  .page .num{position:absolute;top:-20px;left:0;font-size:11.5px;color:#5d6b80}
+  .overlay{position:absolute;inset:0}
+  body.draw .overlay{cursor:crosshair}
+  body.draw .mark{pointer-events:none}
+
+  /* A mark = proposed redaction. "on" will be burned in on export. */
+  .mark{position:absolute;cursor:pointer}
+  .mark.on{background:rgba(12,16,24,.66);box-shadow:0 0 0 1px var(--c),inset 3px 0 0 var(--c)}
+  .mark.off{background:transparent;outline:1.5px dashed var(--c)}
+  .mark.manual.on{background:rgba(12,16,24,.72);box-shadow:0 0 0 1px #0c1018}
+  .mark:hover{filter:brightness(1.35)}
+  .mark .del{display:none;position:absolute;top:-9px;right:-9px;width:18px;height:18px;padding:0;border:0;border-radius:50%;
+             background:var(--bad);color:#fff;font-size:12px;line-height:18px;cursor:pointer}
+  .mark:hover .del{display:block}
+  body.preview .mark.on{background:#000;box-shadow:none}
+  body.preview .mark.off{display:none}
+  .drawing{position:absolute;border:1.5px solid var(--bad);background:rgba(229,100,93,.16)}
+  .flash{animation:flash 1.3s ease-out}
+  @keyframes flash{0%{outline:0 solid #f0a202}25%{outline:4px solid #f0a202;outline-offset:3px}100%{outline:0 solid transparent;outline-offset:3px}}
+
+  .empty-state{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px}
+  .es-card{max-width:460px;text-align:center}
+  .es-card h2{font-size:21px;font-weight:600;margin:18px 0 8px;letter-spacing:-.2px;color:#13233d}
+  .es-card p{margin:0;color:#4a5a72;font-size:14px;line-height:1.6}
+
+  #toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,16px);opacity:0;pointer-events:none;z-index:20;
+         background:var(--ink);color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;max-width:82vw;transition:opacity .2s,transform .2s}
+  #toast.show{opacity:1;transform:translate(-50%,0)}
+  body.busy{cursor:progress}
+
+  @media (max-width:880px){
+    .app{grid-template-columns:1fr;grid-template-rows:auto 1fr;height:auto;min-height:100vh}
+    .side-scroll{overflow:visible}
+    .main{height:100vh}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<!-- Libraries (the ONLY external resources). The worker bundle is loaded as a
+     plain script so pdf.js runs its parser on the main thread; this avoids a
+     cross-origin Worker, which browsers refuse for CDN URLs. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <header class="brand">
+      <svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true">
+        <rect x="1" y="1" width="32" height="32" rx="8" fill="#1a2d4c" stroke="rgba(255,255,255,.12)"/>
+        <rect x="8" y="9" width="18" height="3" rx="1" fill="#93a3bb"/>
+        <rect x="8" y="15.5" width="18" height="4" rx="1" fill="#c79a3b"/>
+        <rect x="8" y="23" width="11" height="3" rx="1" fill="#93a3bb"/>
+      </svg>
+      <div>
+        <div class="brand-name">SecureRedact</div>
+        <div class="brand-sub">Vigneswaran C L, Chartered Accountants</div>
+      </div>
+    </header>
+    <div class="local"><i></i>Files are processed in this browser only. Nothing is uploaded.</div>
+
+    <div class="side-scroll">
+      <section class="step">
+        <h3><span class="n">1</span>Open a PDF</h3>
+        <label class="drop" id="dropZone">
+          <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
+          <strong>Choose PDF</strong>
+          <span>or drop it here</span>
+        </label>
+        <div class="file-meta" id="fileMeta" hidden></div>
+      </section>
+
+      <section class="step">
+        <h3><span class="n">2</span>Find sensitive data</h3>
+        <div class="row">
+          <label for="sensitivity">Sensitivity</label>
+          <select id="sensitivity">
+            <option value="strict" selected>Strict (uses nearby labels)</option>
+            <option value="broad">Broad (pattern only)</option>
+          </select>
+        </div>
+        <div class="cat-grid" id="catGrid"></div>
+        <div class="kw">
+          <label class="lbl" for="kwInput">Custom terms: client names, addresses, figures</label>
+          <div class="kw-input">
+            <input type="text" id="kwInput" placeholder="Type, then press Enter" autocomplete="off">
+            <button id="kwAdd" type="button">Add</button>
+          </div>
+          <div class="chips" id="kwChips"></div>
+        </div>
+        <button class="btn" id="scanBtn" disabled>Run auto-scan</button>
+        <div class="progress" id="scanProg" hidden><div></div></div>
+      </section>
+
+      <section class="step">
+        <h3><span class="n">3</span>Review marks <span class="count" id="markCount">0 active</span></h3>
+        <p class="hint">Click a mark on the page to include or exclude it. Press <kbd>D</kbd> to draw boxes over signatures, stamps or photos, <kbd>Ctrl Z</kbd> to undo a box.</p>
+        <div class="findings" id="findings"></div>
+      </section>
+
+      <section class="step">
+        <h3><span class="n">4</span>Export</h3>
+        <div class="row">
+          <label for="dpi">Resolution</label>
+          <select id="dpi">
+            <option value="150">150 DPI, smaller file</option>
+            <option value="200" selected>200 DPI, balanced</option>
+            <option value="300">300 DPI, print quality</option>
+          </select>
+        </div>
+        <div class="row">
+          <label for="fmt">Image type</label>
+          <select id="fmt">
+            <option value="jpg" selected>JPEG, compact</option>
+            <option value="png">PNG, lossless</option>
+          </select>
+        </div>
+        <label class="check"><input type="checkbox" id="rasterAll" checked><span>Flatten every page <em>(recommended: also removes hidden text, links, form data on unmarked pages)</em></span></label>
+        <label class="check"><input type="checkbox" id="verify" checked><span>Verify the output has no extractable text</span></label>
+        <label class="check"><input type="checkbox" id="log"><span>Also save a redaction log <em>(CSV, values masked)</em></span></label>
+        <button class="btn" id="exportBtn" disabled>Download redacted PDF</button>
+        <div class="progress" id="expProg" hidden><div></div></div>
+        <div class="report" id="exportReport" hidden></div>
+      </section>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="toolbar">
+      <div class="tb">
+        <button class="tool" id="drawBtn" disabled>Draw box<kbd>D</kbd></button>
+        <button class="tool" id="previewBtn" disabled>Preview final<kbd>P</kbd></button>
+      </div>
+      <div class="tb">
+        <button class="tool" id="zoomOut" disabled aria-label="Zoom out">−</button>
+        <span id="zoomLabel">100%</span>
+        <button class="tool" id="zoomIn" disabled aria-label="Zoom in">+</button>
+        <button class="tool" id="fitBtn" disabled>Fit width</button>
+      </div>
+      <div class="tb">
+        <span id="pageInfo">No document</span>
+        <button class="tool" id="clearBtn" disabled>Close document</button>
+      </div>
+    </div>
+    <div class="viewer" id="viewer">
+      <div class="empty-state" id="emptyState">
+        <div class="es-card">
+          <svg width="120" height="140" viewBox="0 0 120 140" aria-hidden="true">
+            <rect x="10" y="6" width="100" height="128" rx="4" fill="#fff" stroke="#b7c1cf"/>
+            <rect x="24" y="24" width="56" height="5" rx="2" fill="#c3ccd8"/>
+            <rect x="24" y="38" width="72" height="4" rx="2" fill="#dde3eb"/>
+            <rect x="24" y="48" width="30" height="7" fill="#13233d"/><rect x="58" y="49" width="38" height="4" rx="2" fill="#dde3eb"/>
+            <rect x="24" y="62" width="72" height="4" rx="2" fill="#dde3eb"/>
+            <rect x="24" y="72" width="44" height="4" rx="2" fill="#dde3eb"/><rect x="70" y="70" width="26" height="7" fill="#13233d"/>
+            <rect x="24" y="86" width="72" height="4" rx="2" fill="#dde3eb"/>
+            <rect x="24" y="108" width="36" height="14" fill="#13233d"/>
+            <rect x="24" y="96" width="50" height="4" rx="2" fill="#dde3eb"/>
+          </svg>
+          <h2>Redact client documents without them leaving this computer</h2>
+          <p>Open a PDF, scan for PAN, Aadhaar, GSTIN, bank details and your own client terms, check the marks, then export a flattened copy with the text underneath removed.</p>
+        </div>
+      </div>
+      <div id="pages"></div>
+    </div>
+  </main>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(() => {
+'use strict';
+
+/* =============================================================================
+   0. LIBRARY BOOTSTRAP
+   ========================================================================== */
+const LIB = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+const pdfjsLib = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
+if (!pdfjsLib || !window.PDFLib) {
+  document.getElementById('emptyState').innerHTML =
+    '<div class="es-card"><h2>The PDF libraries did not load</h2><p>Connect to the internet once so pdf.js and pdf-lib can load from cdnjs, or host the three library files locally and update the script tags.</p></div>';
+  return;
+}
+// Kept for completeness; because pdf.worker.min.js is already loaded as a
+// script (window.pdfjsWorker exists), pdf.js uses its main-thread handler.
+pdfjsLib.GlobalWorkerOptions.workerSrc = LIB + 'pdf.worker.min.js';
+const { PDFDocument } = window.PDFLib;
+
+const PDF_OPTS = { isEvalSupported: false, enableXfa: false, useSystemFonts: true };
+const MAX_EXPORT_PX = 36e6;  // cap bitmap size per page (browser canvas limits)
+
+/* =============================================================================
+   1. DETECTION RULES
+   -----------------------------------------------------------------------------
+   Each category has one or more patterns:
+     re        global RegExp run against the page's reconstructed text
+     context   (optional) RegExp that must match in the `win` characters
+               BEFORE the hit. Applied only in "Strict" mode. This is what
+               stops every 8-digit number being treated as a DIN.
+     validate  (optional) extra check, e.g. Aadhaar Verhoeff checksum.
+   Order matters: earlier categories claim a text span first, so a GSTIN is
+   not also reported as a PAN, a UPI handle is not reported as an email, etc.
+   ========================================================================== */
+
+// Verhoeff checksum used by UIDAI for Aadhaar (last digit is the check digit).
+const VD = [[0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],[3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],
+            [5,9,8,7,6,0,4,3,2,1],[6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],[9,8,7,6,5,4,3,2,1,0]];
+const VP = [[0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],[8,9,1,6,0,4,3,5,2,7],
+            [9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],[2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8]];
+function verhoeffValid(num) {
+  let c = 0;
+  const d = num.split('').reverse().map(Number);
+  for (let i = 0; i < d.length; i++) c = VD[c][VP[i % 8][d[i]]];
+  return c === 0;
+}
+
+const MONTHS = '(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)';
+
+/* -----------------------------------------------------------------------------
+   ADDRESS DETECTION
+   Addresses have no fixed format, so each text line is scored on four kinds
+   of evidence:
+     door   door / plot / flat / survey no., "#12", "12/3," at a segment start
+     kw     street vocabulary (Street, Road, Salai, Nagar, Colony, Floor...)
+            and locality suffixes (-pakkam, -puram, -pettai, -palayam, -abad...)
+     place  a known city, Chennai locality or state name (PLACES below)
+     pin    a 6-digit PIN at the end of the address or after "-" / "PIN"
+   Strict: a line needs 2 kinds of evidence; a neighbouring line with 1 kind
+   is treated as a continuation (multi-line addresses). Broad: 1 kind is enough.
+   Separately, anything after a label such as "Address:", "Regd. Office:",
+   "R/o", "Situated at" is taken, plus up to 4 following short lines, until
+   a blank line or another "Field:" label.
+   Add local place names to PLACES (or use Custom terms) if you need more.
+   -------------------------------------------------------------------------- */
+const PLACES = [
+  // Tamil Nadu
+  'Chennai','Madras','Coimbatore','Madurai','Tiruchirappalli','Trichy','Tiruchy','Salem','Tirunelveli','Tiruppur','Tirupur',
+  'Vellore','Erode','Thoothukudi','Tuticorin','Thanjavur','Tanjore','Dindigul','Kanchipuram','Kancheepuram','Chengalpattu',
+  'Tiruvallur','Thiruvallur','Cuddalore','Villupuram','Viluppuram','Nagapattinam','Karur','Namakkal','Krishnagiri','Dharmapuri',
+  'Hosur','Ooty','Udhagamandalam','Nilgiris','Kumbakonam','Pudukkottai','Sivakasi','Virudhunagar','Ramanathapuram','Sivaganga',
+  'Theni','Nagercoil','Kanyakumari','Tiruvannamalai','Ranipet','Tenkasi','Perambalur','Ariyalur','Karaikudi','Pollachi',
+  'Kallakurichi','Tirupattur','Mayiladuthurai','Tiruvarur','Sriperumbudur',
+  // Chennai localities and arterial roads
+  'Adyar','Anna Nagar','T. Nagar','T Nagar','Mylapore','Alwarpet','Teynampet','Nungambakkam','Kodambakkam','Egmore','Kilpauk',
+  'Guindy','Velachery','Tambaram','Chromepet','Pallavaram','Porur','Ambattur','Avadi','Poonamallee','Perungudi','Thoraipakkam',
+  'Sholinganallur','Thiruvanmiyur','Besant Nagar','Royapettah','Triplicane','Saidapet','Ashok Nagar','K.K. Nagar','K. K. Nagar',
+  'Vadapalani','Perambur','Purasawalkam','Mandaveli','Kotturpuram','R.A. Puram','Raja Annamalaipuram','Madipakkam','Medavakkam',
+  'Pallikaranai','Guduvanchery','Kelambakkam','Siruseri','Ekkattuthangal','Gopalapuram','Chetpet','George Town','Parrys',
+  'Washermanpet','Tondiarpet','Royapuram','Mogappair','Koyambedu','Arumbakkam','Aminjikarai','Virugambakkam','Valasaravakkam',
+  'Ramapuram','Nandanam','West Mambalam','Mambalam','Kolathur','Villivakkam','Madhavaram','Manali','Ennore','Thiruvottiyur',
+  'Anna Salai','Mount Road','Rajiv Gandhi Salai','Old Mahabalipuram Road','East Coast Road','Poonamallee High Road',
+  // Other major cities
+  'Mumbai','Bombay','Delhi','New Delhi','Kolkata','Calcutta','Bengaluru','Bangalore','Hyderabad','Secunderabad','Pune',
+  'Ahmedabad','Surat','Vadodara','Baroda','Rajkot','Jaipur','Jodhpur','Udaipur','Lucknow','Kanpur','Noida','Greater Noida',
+  'Gurugram','Gurgaon','Faridabad','Ghaziabad','Mohali','Ludhiana','Amritsar','Jalandhar','Dehradun','Indore','Bhopal',
+  'Gwalior','Jabalpur','Nagpur','Nashik','Aurangabad','Thane','Navi Mumbai','Kochi','Cochin','Ernakulam','Thiruvananthapuram',
+  'Trivandrum','Kozhikode','Calicut','Thrissur','Kollam','Kannur','Palakkad','Mysuru','Mysore','Mangaluru','Mangalore','Hubballi',
+  'Hubli','Dharwad','Belagavi','Belgaum','Visakhapatnam','Vizag','Vijayawada','Guntur','Nellore','Tirupati','Kurnool','Warangal',
+  'Bhubaneswar','Cuttack','Patna','Ranchi','Jamshedpur','Raipur','Guwahati','Varanasi','Prayagraj','Allahabad','Agra','Meerut',
+  'Srinagar','Shimla','Panaji','Margao','Karaikal',
+  // States and UTs
+  'Tamil Nadu','Tamilnadu','Karnataka','Kerala','Andhra Pradesh','Telangana','Maharashtra','Gujarat','Rajasthan','Uttar Pradesh',
+  'Madhya Pradesh','West Bengal','Bihar','Odisha','Orissa','Punjab','Haryana','Himachal Pradesh','Uttarakhand','Jharkhand',
+  'Chhattisgarh','Assam','Goa','Tripura','Manipur','Meghalaya','Mizoram','Nagaland','Sikkim','Arunachal Pradesh','Puducherry',
+  'Pondicherry','Chandigarh','Jammu','Kashmir','Ladakh','Lakshadweep','Andaman','Nicobar'
+];
+// Case-sensitive on purpose: matches "Chennai" and "CHENNAI" but not "erode" (the verb).
+const PLACE_RE = new RegExp('(?<![A-Za-z])(?:' +
+  [...new Set(PLACES.flatMap(p => [p, p.toUpperCase()]))]
+    .sort((a, b) => b.length - a.length)
+    .map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s*'))
+    .join('|') + ')(?![A-Za-z])', 'g');
+
+const ADDR_KW = /\b(?:street|road|salai|nagar|colony|layout|avenue|lane|cross|marg|gali|chowk|bazaa?r|sector|flat|apartments?|towers?|bhavan|bhawan|enclave|residency|village|taluka?|tehsil|mandal|sipcot|midc|veedhi|theru|koil|agraharam)\b|\b(?:st|rd|opp|dist|extn|bldg|apts?|ave)\.|\bP\.\s?O\b/gi;
+// Weak words are common in ordinary prose too ("near future", "phase 2"), so they never count on their own.
+const ADDR_WEAK = /\b(?:near|opposite|behind|junction|circle|estate|block|phase|stage|floor|complex|building|plaza|gardens?|extension|district)\b/gi;
+const ADDR_SUFFIX = /\b[A-Z][a-z]+(?:nagar|puram|pakkam|pettai|pettah|palayam|kuppam|halli|abad|ganj|wadi|gaon|patti|pet)\b|\b[A-Z]+(?:NAGAR|PURAM|PAKKAM|PETTAI|PETTAH|PALAYAM|KUPPAM|HALLI|ABAD|GANJ|WADI|GAON|PATTI|PET)\b/g;
+const ADDR_DOOR = /\b(?:Door|D|Plot|Flat|Shop|House|H|Survey|S|New|Old|Site|Unit|Office)\s*\.?\s*No\s*\.?\s*[:.\-]?\s*\d+[A-Za-z]?(?:\s*[\/\-]\s*\d+[A-Za-z]?)*|#\s?\d+[A-Za-z]?(?:[\/\-]\d+[A-Za-z]?)*|\bNo\s*\.\s*\d+[A-Za-z]?(?:\s*[\/\-]\s*\d+[A-Za-z]?)*(?=\s*,)|(?<![\d,.])(?!(?:19|20)\d{2}\s*,)\d{1,4}[A-Za-z]?(?:\s*[\/\-]\s*\d+[A-Za-z]?)*(?=\s*,(?!\d))/gi;
+const ADDR_PIN = /(?<!\d)[1-9]\d{2}\s?\d{3}(?!\d)/g;
+const ADDR_LABEL = /\b(?:regd\.?\s*(?:office|off\.?)|registered\s+office|corporate\s+office|head\s+office|branch\s+office|(?:communication|permanent|present|residential|office|correspondence|billing|shipping|delivery|business)\s+address|address(?:\s+of\s+[a-z ]{2,30}?)?|addr\.?|residing\s+at|resident\s+of|r\/o|situated\s+at|located\s+at)\s*[:\-–]?\s*/i;
+const FIELD_LABEL = /^\s*[A-Za-z][A-Za-z .\/&()'-]{1,40}:/;
+
+function addrSignals(line) {
+  const sig = [];
+  const add = (t, m, len) => sig.push({ t, s: m.index, e: m.index + (len ?? m[0].length) });
+  for (const m of line.matchAll(ADDR_KW)) add('kw', m);
+  for (const m of line.matchAll(ADDR_WEAK)) add('weak', m);
+  for (const m of line.matchAll(ADDR_SUFFIX)) add('kw', m);
+  for (const m of line.matchAll(PLACE_RE)) add('place', m);
+  for (const m of line.matchAll(ADDR_DOOR)) add('door', m, m[0].replace(/[\s,]+$/, '').length);
+  for (const m of line.matchAll(ADDR_PIN)) {
+    // Count a 6-digit number as a PIN only where addresses put it, so amounts in tables are ignored.
+    const before = line.slice(Math.max(0, m.index - 14), m.index);
+    const after = line.slice(m.index + m[0].length);
+    const afterPlace = sig.some(x => x.t === 'place' && x.e <= m.index && m.index - x.e <= 3);   // "CHENNAI 600040"
+    if (afterPlace || /(pin\s*(code)?\s*[:.]?|[-–—])\s*$/i.test(before) || /^\s*(?:[.,;)]|$|India|INDIA|Tamil|TAMIL|\()/.test(after)) add('pin', m);
+  }
+  return sig.sort((a, b) => a.s - b.s);
+}
+
+// Span on one line from the first to the last piece of evidence.
+function addrLineSpan(line, sig) {
+  const first = sig[0];
+  const last = sig.reduce((a, b) => (b.e > a.e ? b : a));
+  let s;
+  if (first.t !== 'kw' && first.t !== 'weak') s = first.s;
+  else {   // "Gandhi Street": start at the comma-segment start, at most 3 words back
+    s = Math.max(line.lastIndexOf(',', first.s - 1), line.lastIndexOf(':', first.s - 1), line.lastIndexOf(';', first.s - 1)) + 1;
+    if (first.s - s > 40) { const w = line.slice(0, first.s).match(/(?:\S+\s+){0,3}$/); s = first.s - (w ? w[0].length : 0); }
+  }
+  let e;
+  if (last.t === 'pin' || last.t === 'place') e = last.e;
+  else { const k = line.slice(last.e).search(/[,;:]/); e = Math.min(k < 0 ? line.length : last.e + k, last.e + 40); }
+  while (s < e && /\s/.test(line[s])) s++;
+  while (e > s && /[\s,;]/.test(line[e - 1])) e--;
+  return [s, e];
+}
+
+function findAddresses(str, strict) {
+  const lines = []; let off = 0;
+  for (const t of str.split('\n')) { lines.push({ s: off, t }); off += t.length + 1; }
+  const info = lines.map(L => {
+    const sig = addrSignals(L.t), types = new Set(sig.map(x => x.t));
+    const strong = [...types].filter(t => t !== 'weak').length;
+    return { sig, score: strong ? strong + (types.has('weak') ? 1 : 0) : 0 };   // weak words only add to other evidence
+  });
+  const need = strict ? 2 : 1;
+  const core = info.map(x => x.score >= need);
+  const ranges = [];
+
+  // 1. Evidence-based lines (+ one-line continuation above/below)
+  lines.forEach((L, i) => {
+    const strongSig = info[i].sig.some(x => x.t !== 'weak');
+    const on = core[i] || (strongSig && (core[i - 1] || core[i + 1]));
+    if (!on || L.t.length > 220) return;
+    const [a, b] = addrLineSpan(L.t, info[i].sig);
+    if (b > a) ranges.push([L.s + a, L.s + b]);
+  });
+
+  // 2. Labelled blocks: "Address:", "Regd. Office:", "R/o", "Situated at" ...
+  lines.forEach((L, i) => {
+    const m = L.t.match(ADDR_LABEL); if (!m) return;
+    const pre = L.t.slice(0, m.index);
+    if (/(e-?\s?mail|web|ip|mac|site|url)\s*$/i.test(pre)) return;          // "Email address:"
+    const labelEnd = L.s + m.index + m[0].length;
+    const rest = L.t.slice(m.index + m[0].length), restTrim = rest.trim();
+    const restSig = addrSignals(rest);
+    let s, e, allowCont;
+    if (/[:\-–]\s*$/.test(m[0]) || (!pre.trim() && !restTrim)) {
+      // "Address:" / "Regd. Office -" / a bare "Address" heading: take the rest and the lines below
+      s = restTrim.length > 1 ? labelEnd : null; e = L.s + L.t.trimEnd().length; allowCont = true;
+    } else if (restSig.some(x => x.t !== 'weak')) {
+      // prose such as "situated at 22, Pantheon Road, Egmore were leased": only the address part
+      const [a, b] = addrLineSpan(rest, restSig); s = labelEnd + a; e = labelEnd + b; allowCont = false;
+    } else return;                                                        // "to address the issue"
+    for (let j = i + 1, n = 0; allowCont && j < lines.length && n < 4; j++, n++) {
+      const T = lines[j].t, tt = T.trim();
+      if (!tt || T.length > 110) break;
+      if (info[j].score === 0 && (FIELD_LABEL.test(T) || tt.length > 60)) break;   // next field, e.g. "PAN:"
+      if (s === null) s = lines[j].s + (T.length - T.trimStart().length);
+      e = lines[j].s + T.trimEnd().length;
+    }
+    if (s !== null && e > s) ranges.push([s, e]);
+  });
+
+  ranges.sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const r of ranges) {
+    const q = out[out.length - 1];
+    if (q && r[0] <= q[1] + 1) q[1] = Math.max(q[1], r[1]); else out.push(r.slice());
+  }
+  return out;
+}
+
+const CATEGORIES = [
+  { key: 'gstin', label: 'GSTIN', color: '#0ea5e9', hint: '15 chars: state code + PAN + entity + Z + check',
+    patterns: [{ re: /(?<![A-Z0-9])\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z](?![A-Z0-9])/g }] },
+
+  { key: 'cin', label: 'CIN', color: '#6366f1', hint: 'L/U + 5 digits + state + year + type + 6 digits (21 chars)',
+    patterns: [{ re: /(?<![A-Z0-9])[LU]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}(?![A-Z0-9])/g }] },
+
+  { key: 'pan', label: 'PAN', color: '#e11d48', hint: 'AAAAA9999A; 4th letter = holder type (P, C, H, F, A, T, B, L, J, G)',
+    patterns: [{ re: /(?<![A-Z0-9])[A-Z]{3}[ABCFGHJLPT][A-Z]\d{4}[A-Z](?![A-Z0-9])/g }] },
+
+  { key: 'tan', label: 'TAN', color: '#f97316', hint: 'AAAA99999A',
+    patterns: [{ re: /(?<![A-Z0-9])[A-Z]{4}\d{5}[A-Z](?![A-Z0-9])/g }] },
+
+  { key: 'email', label: 'Email ID', color: '#14b8a6',
+    patterns: [{ re: /(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}/g }] },
+
+  // UPI handle has NO dot after @ (name@okaxis, 98xxxxxx@ybl); that separates it from email.
+  { key: 'upi', label: 'UPI ID', color: '#22c55e',
+    patterns: [{ re: /(?<![A-Za-z0-9._\-])[A-Za-z0-9._\-]{2,256}@[A-Za-z][A-Za-z0-9]{1,63}(?![A-Za-z0-9.\-])/g }] },
+
+  { key: 'aadhaar', label: 'Aadhaar', color: '#dc2626', hint: '12 digits, first digit 2-9; Strict mode checks the Verhoeff digit',
+    patterns: [
+      { re: /(?<![\dA-Za-z])[2-9]\d{3}[ \u00A0-]?\d{4}[ \u00A0-]?\d{4}(?!\d)/g,
+        validate: (m, strict) => !strict || verhoeffValid(m.replace(/\D/g, '')) },
+      { re: /(?<![A-Za-z0-9])[Xx*]{4}[ \u00A0-]?[Xx*]{4}[ \u00A0-]?\d{4}(?!\d)/g }   // masked Aadhaar
+    ] },
+
+  { key: 'bank', label: 'Bank a/c, IFSC', color: '#eab308', hint: 'IFSC: 4 letters + 0 + 6 chars. Account: 9-18 digits near "A/c", "Account", "Bank"',
+    patterns: [
+      { re: /(?<![A-Z0-9])[A-Z]{4}0[A-Z0-9]{6}(?![A-Z0-9])/g },
+      { re: /(?<![\dA-Za-z])\d{9,18}(?!\d)/g, win: 45,
+        context: /(a\s*\/\s*c|acc(?:oun)?t|acct|bank|savings|s\.?\s*b\.?\s*a\/?c|current\s+a|o\.?d\.?\s*a\/?c|cc\s*a\/?c)/i }
+    ] },
+
+  { key: 'mobile', label: 'Contact no.', color: '#3b82f6', hint: '10 digits starting 6-9, optional +91 / 0091 / 0',
+    patterns: [{ re: /(?<![\d+])(?:(?:\+|00)91[\s\-]?|0)?[6-9]\d{4}[\s\-]?\d{5}(?!\d)/g }] },
+
+  { key: 'din', label: 'DIN', color: '#8b5cf6', hint: '8 digits; Strict mode needs "DIN" nearby',
+    patterns: [{ re: /(?<!\d)\d{8}(?!\d)/g, win: 30, context: /(\bDIN\b|\bDPIN\b|Director\s*Identification)/i }] },
+
+  { key: 'txn', label: 'Challan, txn, ref no.', color: '#ec4899', hint: '14-22 alphanumerics near Challan, Txn, Ref, UTR, ARN, BRN, CRN, SRN',
+    patterns: [{ re: /(?<![A-Za-z0-9])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{14,22}(?![A-Za-z0-9])/g, win: 60,
+      context: /(challan|\btxn|transaction|trans\.?\s*id|\bref(?:erence)?\b|\butr\b|\bbrn\b|\bcrn\b|\bsrn\b|\barn\b|\birn\b|\burn\b|\bcpin\b|\bbsr\b|ack(?:nowledge?ment)?|receipt)/i }] },
+
+  { key: 'dob', label: 'Date of birth', color: '#f59e0b', hint: 'Strict: dates near "DOB" / "Date of Birth". Broad: every date',
+    patterns: [
+      { re: /(?<!\d)(?:0?[1-9]|[12]\d|3[01])([\/\-.])(?:0?[1-9]|1[0-2])\1(?:19|20)\d{2}(?!\d)/g, win: 50,
+        context: /(D\.?\s?O\.?\s?B|date\s*of\s*birth|birth\s*date|\bborn\b)/i },
+      { re: new RegExp('(?<![\\dA-Za-z])(?:0?[1-9]|[12]\\d|3[01])(?:st|nd|rd|th)?[\\s\\-]+' + MONTHS + '[\\s\\-,]+(?:19|20)\\d{2}(?!\\d)', 'gi'), win: 50,
+        context: /(D\.?\s?O\.?\s?B|date\s*of\s*birth|birth\s*date|\bborn\b)/i },
+      { re: /(?<!\d)(?:19|20)\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?!\d)/g, win: 50,
+        context: /(D\.?\s?O\.?\s?B|date\s*of\s*birth|birth\s*date|\bborn\b)/i }
+    ] },
+
+  // "soft": may partly overlap an ID already found (e.g. a phone no. inside an address line);
+  // skipped only when it lies entirely inside an earlier mark.
+  { key: 'address', label: 'Address', color: '#0d9488', hint: 'Door no., street, locality, city, PIN lines, and text after "Address:", "Regd. Office:", "R/o"',
+    patterns: [{ find: findAddresses, soft: true }] },
+
+  { key: 'city', label: 'City, state', color: '#a16207', hint: 'Indian cities, Chennai localities and state names wherever they appear',
+    patterns: [{ re: PLACE_RE, soft: true }] },
+
+  { key: 'pin', label: 'PIN code', color: '#64748b', hint: 'Strict: after "PIN" or "City - "; Broad: any 6-digit number',
+    patterns: [{ re: /(?<!\d)[1-9]\d{2}[ \u00A0]?\d{3}(?!\d)/g, win: 25,
+      context: /((?:pin\s*code|pincode|\bpin\b|postal\s*code|zip)\s*[:.\-–]?\s*$|[A-Za-z]\s*[-–—]\s*$)/i }] }
+];
+const EXTRA = {
+  custom: { key: 'custom', label: 'Custom terms', color: '#a855f7' },
+  manual: { key: 'manual', label: 'Drawn boxes', color: '#0c1018' }
+};
+const CAT = Object.fromEntries([...CATEGORIES, EXTRA.custom, EXTRA.manual].map(c => [c.key, c]));
+
+/* =============================================================================
+   2. STATE
+   -----------------------------------------------------------------------------
+   Every redaction ("finding") is stored in REFERENCE SPACE:
+     the pdf.js viewport at scale 1 = PDF points (1/72 inch), origin TOP-LEFT,
+     y growing DOWN, with the page's /Rotate already applied.
+   Screen position  = reference * zoom
+   Export bitmap    = reference * (dpi / 72)
+   Because both are plain multiplications of the same space, what you see on
+   screen is exactly what gets burned into the export.
+   ========================================================================== */
+const state = {
+  pdf: null, bytes: null, fileName: '', numPages: 0, zoom: 1,
+  pages: [],            // {num, w, h, wrap, canvas, overlay, rendered, rendering, visible, task, text}
+  findings: [],         // {id, page, rects:[{x,y,w,h}], source:'auto'|'custom'|'manual', cat, text, enabled}
+  keywords: [], catOn: {}, undo: [], noText: [],
+  drawMode: false, preview: false, nextId: 1, renderGen: 0, scanned: false, busy: false,
+  openGroups: new Set()
+};
+CATEGORIES.forEach(c => { state.catOn[c.key] = true; });
+
+/* =============================================================================
+   3. SMALL HELPERS
+   ========================================================================== */
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const tick = () => new Promise(r => setTimeout(r, 0));
+const fmtBytes = n => n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+let toastTimer;
+function toast(msg, ms = 3400) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), ms);
+}
+function progress(sel) {
+  const el = $(sel), bar = el.firstElementChild;
+  el.hidden = false; bar.style.width = '0%';
+  return { set: f => { bar.style.width = (f * 100).toFixed(1) + '%'; }, done: () => setTimeout(() => { el.hidden = true; }, 500) };
+}
+function download(data, name, type) {
+  const url = URL.createObjectURL(new Blob([data], { type }));
+  const a = document.createElement('a'); a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 15000);
+}
+function setBusy(on) { state.busy = on; document.body.classList.toggle('busy', on); updateControls(); }
+function updateControls() {
+  const has = !!state.pdf, b = state.busy;
+  $('#scanBtn').disabled = !has || b;
+  $('#exportBtn').disabled = !has || b;
+  ['#drawBtn', '#previewBtn', '#zoomIn', '#zoomOut', '#fitBtn', '#clearBtn'].forEach(s => { $(s).disabled = !has; });
+  $('#fileInput').disabled = b;
+}
+
+/* =============================================================================
+   4. OPEN / CLOSE DOCUMENT
+   ========================================================================== */
+const io = new IntersectionObserver(entries => {
+  for (const en of entries) {
+    const p = state.pages[+en.target.dataset.page - 1];
+    if (!p) continue;
+    p.visible = en.isIntersecting;
+    if (p.visible) renderPage(p);
+  }
+}, { root: $('#viewer'), rootMargin: '700px 0px' });
+
+async function openFile(file) {
+  if (!file) return;
+  if (file.type !== 'application/pdf' && !/\.pdf$/i.test(file.name)) { toast('Choose a PDF file.'); return; }
+  closeDocument();
+  setBusy(true);
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    // pdf.js may take ownership of the buffer, so it gets a copy; the original
+    // bytes are kept for pdf-lib (copying unmarked pages on export).
+    const task = pdfjsLib.getDocument({ ...PDF_OPTS, data: bytes.slice() });
+    task.onPassword = (update, reason) => {
+      const pw = window.prompt(reason === pdfjsLib.PasswordResponses.INCORRECT_PASSWORD
+        ? 'Incorrect password. Try again:' : 'This PDF is password-protected. Enter the password to open it:');
+      if (pw === null) task.destroy(); else update(pw);
+    };
+    const pdf = await task.promise;
+    Object.assign(state, { pdf, bytes, fileName: file.name, numPages: pdf.numPages });
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const vp = (await pdf.getPage(i)).getViewport({ scale: 1 });   // reference size in points
+      state.pages.push(makeShell(i, vp.width, vp.height));
+    }
+    $('#emptyState').hidden = true;
+    state.zoom = fitZoom();
+    layoutAll();
+    $('#fileMeta').hidden = false;
+    $('#fileMeta').innerHTML = `<b>${esc(file.name)}</b><br>${pdf.numPages} page${pdf.numPages > 1 ? 's' : ''}, ${fmtBytes(bytes.length)}`;
+    $('#pageInfo').textContent = `${pdf.numPages} page${pdf.numPages > 1 ? 's' : ''}`;
+    renderFindings();
+    toast('Document opened. Run the auto-scan or draw boxes.');
+  } catch (e) {
+    console.error(e);
+    closeDocument();
+    toast('Could not open this PDF: ' + (e && e.message ? e.message : e), 6000);
+  } finally { setBusy(false); }
+}
+
+function makeShell(num, w, h) {
+  const wrap = document.createElement('div');
+  wrap.className = 'page'; wrap.dataset.page = num;
+  wrap.innerHTML = `<span class="num">Page ${num}</span>`;
+  const canvas = document.createElement('canvas');
+  const overlay = document.createElement('div');
+  overlay.className = 'overlay'; overlay.dataset.page = num;
+  wrap.append(canvas, overlay);
+  $('#pages').appendChild(wrap);
+  io.observe(wrap);
+  return { num, w, h, wrap, canvas, overlay, rendered: false, rendering: false, visible: false, task: null, text: null };
+}
+
+function closeDocument() {
+  state.renderGen++;
+  for (const p of state.pages) { try { p.task && p.task.cancel(); } catch (_) {} io.unobserve(p.wrap); }
+  if (state.pdf) state.pdf.destroy();
+  Object.assign(state, { pdf: null, bytes: null, fileName: '', numPages: 0, pages: [], findings: [], undo: [], noText: [], scanned: false });
+  $('#pages').innerHTML = '';
+  $('#emptyState').hidden = false;
+  $('#fileMeta').hidden = true;
+  $('#exportReport').hidden = true;
+  $('#scanBtn').textContent = 'Run auto-scan';
+  $('#pageInfo').textContent = 'No document';
+  setDraw(false); setPreview(false);
+  renderFindings(); updateControls();
+}
+
+/* =============================================================================
+   5. RENDERING (lazy, per page, re-rendered on zoom)
+   ========================================================================== */
+function fitZoom() {
+  const avail = $('#viewer').clientWidth - 64;
+  const maxW = Math.max(...state.pages.map(p => p.w), 1);
+  return Math.max(0.4, Math.min(2, avail / maxW));
+}
+
+function layoutAll() {
+  state.renderGen++;
+  for (const p of state.pages) {
+    if (p.task) { try { p.task.cancel(); } catch (_) {} }
+    p.rendered = false;
+    const w = p.w * state.zoom, h = p.h * state.zoom;
+    p.wrap.style.width = w + 'px'; p.wrap.style.height = h + 'px';
+    p.canvas.style.width = w + 'px'; p.canvas.style.height = h + 'px';   // stretch old bitmap until re-rendered
+    renderOverlay(p);
+    if (p.visible) renderPage(p);
+  }
+  $('#zoomLabel').textContent = Math.round(state.zoom * 100) + '%';
+}
+
+async function renderPage(p) {
+  if (p.rendered || p.rendering || !state.pdf) return;
+  p.rendering = true;
+  const gen = state.renderGen, pdf = state.pdf;
+  try {
+    const page = await pdf.getPage(p.num);
+    if (gen !== state.renderGen || pdf !== state.pdf) return;
+    const vp = page.getViewport({ scale: state.zoom });
+    // Canvas backing store is multiplied by devicePixelRatio for sharp text on
+    // high-DPI screens; CSS size stays at vp.width x vp.height, which is what
+    // the overlay (and therefore every mark) is positioned against.
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    p.canvas.width = Math.floor(vp.width * dpr);
+    p.canvas.height = Math.floor(vp.height * dpr);
+    p.task = page.render({
+      canvasContext: p.canvas.getContext('2d'), viewport: vp,
+      transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+      annotationMode: pdfjsLib.AnnotationMode.ENABLE
+    });
+    await p.task.promise;
+    if (gen === state.renderGen) p.rendered = true;
+  } catch (e) {
+    if (!e || e.name !== 'RenderingCancelledException') console.error(e);
+  } finally {
+    p.rendering = false; p.task = null;
+    if (!p.rendered && p.visible && state.pdf && gen !== state.renderGen) renderPage(p);
+  }
+}
+
+function renderOverlay(p) {
+  p.overlay.querySelectorAll('.mark').forEach(n => n.remove());
+  const z = state.zoom;
+  for (const f of state.findings) {
+    if (f.page !== p.num) continue;
+    for (const r of f.rects) {
+      const d = document.createElement('div');
+      d.className = 'mark ' + (f.enabled ? 'on' : 'off') + (f.source === 'manual' ? ' manual' : '');
+      d.dataset.id = f.id;
+      // reference space -> screen: multiply by zoom (see section 2)
+      d.style.cssText = `left:${r.x * z}px;top:${r.y * z}px;width:${r.w * z}px;height:${r.h * z}px;--c:${CAT[f.cat].color}`;
+      d.title = `${CAT[f.cat].label}${f.text ? ': ' + f.text : ''}. Click to ${f.enabled ? 'exclude' : 'include'}.`;
+      if (f.source === 'manual') {
+        const x = document.createElement('button');
+        x.className = 'del'; x.textContent = '×'; x.title = 'Delete box'; x.dataset.del = f.id;
+        d.appendChild(x);
+      }
+      p.overlay.appendChild(d);
+    }
+  }
+}
+
+/* =============================================================================
+   6. TEXT LAYER -> COORDINATES
+   -----------------------------------------------------------------------------
+   pdf.js getTextContent() returns text runs ("items"). Each item has:
+     str        the characters
+     transform  [a,b,c,d,e,f]: maps TEXT space to PDF USER space
+                (e,f = baseline start of the run; a..d = font size, skew, rotation)
+     width      advance width of the run in user-space units (points)
+   The page viewport has its own transform: USER space (origin bottom-left,
+   y up) -> VIEWPORT space (origin top-left, y down, page /Rotate applied).
+
+   Util.transform(viewport.transform, item.transform) composes the two, giving
+   tx where:
+     (tx[4], tx[5])  = baseline start of the run in reference (viewport) space
+     (tx[0], tx[1])  = direction of the baseline, length = horizontal font scale
+     (tx[2], tx[3])  = "up" direction of the glyphs, length = font height
+   (For ordinary text on an unrotated page: tx[3] = -fontSize, i.e. up = -y.)
+
+   A box for characters [a, b) of a run is the quadrilateral:
+     baseline from  origin + u * len * f0   to   origin + u * len * f1
+     extended up by the font ascent and down by the descent,
+   where f0/f1 are the fractions of the run's width taken by the first a / b
+   characters (measured with canvas measureText in the run's font family, so
+   proportional fonts are handled better than an equal-width split).
+   The axis-aligned bounding box of that quadrilateral is the redaction rect.
+   This works for rotated pages and rotated text alike.
+   ========================================================================== */
+const mctx = document.createElement('canvas').getContext('2d');
+
+function geometry(it, vp, style) {
+  const tx = pdfjsLib.Util.transform(vp.transform, it.transform);
+  const sx = Math.hypot(tx[0], tx[1]) || 1;
+  const sy = Math.hypot(tx[2], tx[3]);
+  const h = sy || sx;                                        // font height in points
+  const ux = tx[0] / sx, uy = tx[1] / sx;                    // baseline unit vector
+  const vx = sy ? tx[2] / sy : uy, vy = sy ? tx[3] / sy : -ux; // glyph "up" unit vector
+  let len = (style.vertical ? it.height : it.width) * vp.scale;
+  if (!len) len = h * 0.5 * it.str.length;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const asc = clamp(style.ascent ? style.ascent : (style.descent ? 1 + style.descent : 0.8), 0.7, 1.05);
+  const desc = clamp(style.descent ? Math.abs(style.descent) : 0.22, 0.15, 0.35);
+  return { str: it.str, family: style.fontFamily || 'sans-serif', ox: tx[4], oy: tx[5], ux, uy, vx, vy, h, len, asc: asc * h, desc: desc * h };
+}
+
+/* Rebuilds one searchable string per page and a char-index -> (item, offset)
+   map, inserting spaces / newlines where the geometry shows a gap or a new
+   line. Regexes run on this string; hits are mapped back through `map`. */
+async function getPageText(p) {
+  if (p.text) return p.text;
+  const page = await state.pdf.getPage(p.num);
+  const vp = page.getViewport({ scale: 1 });
+  const tc = await page.getTextContent();
+  let str = ''; const map = []; const items = []; let prev = null;
+  const push = (ch, m) => { str += ch; map.push(m); };
+
+  for (const it of tc.items) {
+    if (typeof it.str !== 'string') continue;                 // marked-content markers
+    if (!it.str.length) { if (it.hasEOL && str && !str.endsWith('\n')) push('\n', null); continue; }
+    const g = geometry(it, vp, tc.styles[it.fontName] || {});
+    if (prev && str && !str.endsWith('\n')) {
+      const ex = prev.ox + prev.ux * prev.len, ey = prev.oy + prev.uy * prev.len;   // end of previous run
+      const dx = g.ox - ex, dy = g.oy - ey;
+      const along = dx * prev.ux + dy * prev.uy;                                    // gap along baseline
+      const perp = Math.abs(dx * prev.vx + dy * prev.vy);                           // offset between baselines
+      if (perp > 0.6 * Math.max(prev.h, g.h) || along < -2 * prev.h) push('\n', null);
+      else if (along > 0.22 * g.h && !/\s$/.test(str) && !/^\s/.test(it.str)) push(' ', null);
+    }
+    const idx = items.length; items.push(g);
+    for (let k = 0; k < it.str.length; k++) push(it.str[k], { i: idx, k });
+    if (it.hasEOL) push('\n', null);
+    prev = g;
+  }
+  page.cleanup();
+  p.text = { str, map, items };
+  return p.text;
+}
+
+function measureFrac(g, a, b) {
+  const n = g.str.length;
+  if (a <= 0 && b >= n) return [0, 1];
+  mctx.font = `100px ${g.family}`;
+  const full = mctx.measureText(g.str).width;
+  if (!full) return [a / n, b / n];
+  return [mctx.measureText(g.str.slice(0, a)).width / full, mctx.measureText(g.str.slice(0, b)).width / full];
+}
+
+function subRect(g, a, b, pw, ph) {
+  const [f0, f1] = measureFrac(g, a, b);
+  const x0 = g.ox + g.ux * g.len * f0, y0 = g.oy + g.uy * g.len * f0;
+  const x1 = g.ox + g.ux * g.len * f1, y1 = g.oy + g.uy * g.len * f1;
+  const pts = [
+    [x0 + g.vx * g.asc, y0 + g.vy * g.asc], [x0 - g.vx * g.desc, y0 - g.vy * g.desc],
+    [x1 + g.vx * g.asc, y1 + g.vy * g.asc], [x1 - g.vx * g.desc, y1 - g.vy * g.desc]
+  ];
+  const PAD = 1.2;   // points of safety margin around glyphs
+  const xs = pts.map(q => q[0]), ys = pts.map(q => q[1]);
+  const x = Math.max(0, Math.min(...xs) - PAD), y = Math.max(0, Math.min(...ys) - PAD);
+  const X = Math.min(pw, Math.max(...xs) + PAD), Y = Math.min(ph, Math.max(...ys) + PAD);
+  return { x, y, w: X - x, h: Y - y };
+}
+
+function mergeRects(rs) {
+  const out = [];
+  for (const r of rs) {
+    const q = out.find(q => {
+      const m = Math.min(q.h, r.h);
+      return Math.abs(q.y - r.y) < m * 0.5 && Math.abs(q.y + q.h - r.y - r.h) < m * 0.5 &&
+             r.x <= q.x + q.w + m && r.x + r.w >= q.x - m;
+    });
+    if (q) {
+      const x1 = Math.min(q.x, r.x), y1 = Math.min(q.y, r.y);
+      const x2 = Math.max(q.x + q.w, r.x + r.w), y2 = Math.max(q.y + q.h, r.y + r.h);
+      Object.assign(q, { x: x1, y: y1, w: x2 - x1, h: y2 - y1 });
+    } else out.push({ ...r });
+  }
+  return out;
+}
+
+// Character range [s, e) of the page string -> list of rects in reference space
+function rangeToRects(p, s, e) {
+  const { map, items } = p.text;
+  const groups = new Map();
+  for (let c = s; c < e; c++) {
+    const m = map[c]; if (!m) continue;
+    const g = groups.get(m.i);
+    if (!g) groups.set(m.i, { a: m.k, b: m.k + 1 });
+    else { g.a = Math.min(g.a, m.k); g.b = Math.max(g.b, m.k + 1); }
+  }
+  const rects = [];
+  for (const [i, g] of groups) rects.push(subRect(items[i], g.a, g.b, p.w, p.h));
+  return mergeRects(rects.filter(r => r.w > 0 && r.h > 0));
+}
+
+/* =============================================================================
+   7. AUTO-SCAN
+   ========================================================================== */
+// Returns [start, end] character ranges for one pattern: either a custom
+// finder (addresses) or a regex with optional context / validation.
+function patternHits(pat, str, strict) {
+  if (pat.find) return pat.find(str, strict);
+  const out = [], re = pat.re; re.lastIndex = 0; let m;
+  while ((m = re.exec(str))) {
+    if (!m[0].length) { re.lastIndex++; continue; }
+    const s = m.index, e = s + m[0].length;
+    if (strict && pat.context && !pat.context.test(str.slice(Math.max(0, s - (pat.win || 40)), s))) continue;
+    if (pat.validate && !pat.validate(m[0], strict)) continue;
+    out.push([s, e]);
+  }
+  return out;
+}
+
+function addFinding(p, s, e, source, cat, text) {
+  const rects = rangeToRects(p, s, e);
+  if (!rects.length) return false;
+  state.findings.push({ id: state.nextId++, page: p.num, rects, source, cat, text: text.replace(/\s+/g, ' ').trim(), enabled: true });
+  return true;
+}
+
+async function runScan() {
+  if (!state.pdf || state.busy) return;
+  setBusy(true);
+  const strict = $('#sensitivity').value === 'strict';
+  state.findings = state.findings.filter(f => f.source === 'manual');   // keep drawn boxes
+  state.noText = [];
+  const kwRes = state.keywords.map(k => new RegExp(escapeRe(k).replace(/\s+/g, '\\s*'), 'gi'));
+  const prog = progress('#scanProg');
+  let nAuto = 0, nCustom = 0;
+  try {
+    for (const p of state.pages) {
+      const t = await getPageText(p);
+      if (!t.str.replace(/\s/g, '').length) state.noText.push(p.num);
+      const claimed = [];
+      for (const cat of CATEGORIES) {
+        if (!state.catOn[cat.key]) continue;
+        for (const pat of cat.patterns) {
+          for (const [s, e] of patternHits(pat, t.str, strict)) {
+            const blocked = pat.soft
+              ? claimed.some(([a, b]) => s >= a && e <= b)      // soft: skip only if fully inside
+              : claimed.some(([a, b]) => s < b && e > a);       // hard: skip on any overlap
+            if (blocked) continue;
+            claimed.push([s, e]);
+            if (addFinding(p, s, e, 'auto', cat.key, t.str.slice(s, e))) nAuto++;
+          }
+        }
+      }
+      for (const re of kwRes) {
+        re.lastIndex = 0; let m;
+        while ((m = re.exec(t.str))) {
+          if (!m[0].length) { re.lastIndex++; continue; }
+          if (addFinding(p, m.index, m.index + m[0].length, 'custom', 'custom', m[0])) nCustom++;
+        }
+      }
+      renderOverlay(p);
+      prog.set(p.num / state.numPages);
+      if (p.num % 4 === 0) await tick();
+    }
+    state.scanned = true;
+    $('#scanBtn').textContent = 'Re-run scan';
+    renderFindings();
+    toast(`Found ${nAuto} identifier${nAuto === 1 ? '' : 's'} and ${nCustom} custom term match${nCustom === 1 ? '' : 'es'}.`);
+  } catch (e) {
+    console.error(e); toast('Scan failed: ' + (e.message || e), 6000);
+  } finally { prog.done(); setBusy(false); }
+}
+
+/* =============================================================================
+   8. REVIEW PANEL
+   ========================================================================== */
+function renderFindings() {
+  const order = [...CATEGORIES.map(c => c.key), 'custom', 'manual'];
+  const groups = order.map(k => ({ k, list: state.findings.filter(f => f.cat === k) })).filter(g => g.list.length);
+  let html = '';
+  if (state.noText.length) {
+    const pg = state.noText.length > 12 ? state.noText.slice(0, 12).join(', ') + '…' : state.noText.join(', ');
+    html += `<div class="note">No text layer on page ${pg}. These look like scans, so auto-detect cannot read them. Draw boxes over the sensitive areas.</div>`;
+  }
+  if (!groups.length) {
+    html += `<div class="empty">${!state.pdf ? 'Open a PDF to begin.' : state.scanned
+      ? 'Nothing detected. Try Broad sensitivity, add custom terms, or draw boxes.' : 'No marks yet. Run the auto-scan or draw boxes.'}</div>`;
+  }
+  for (const g of groups) {
+    const c = CAT[g.k], on = g.list.filter(f => f.enabled).length, open = state.openGroups.has(g.k);
+    html += `<div class="grp${open ? ' open' : ''}">
+      <div class="grp-head" data-open="${g.k}">
+        <span class="chev">▶</span><span class="sw" style="--c:${c.color}"></span>
+        <span class="gl">${esc(c.label)}</span><span class="gc">${on}/${g.list.length}</span>
+        <label class="switch" title="Include or exclude all"><input type="checkbox" data-grp="${g.k}" ${on ? 'checked' : ''} aria-label="Include all ${esc(c.label)}"><span></span></label>
+      </div>
+      <ul>${g.list.map(f => `<li><input type="checkbox" data-fid="${f.id}" ${f.enabled ? 'checked' : ''} aria-label="Include mark">
+        <span class="pg">p.${f.page}</span><code data-goto="${f.id}" title="${esc(f.text || 'Drawn box')}">${esc(f.text || 'Drawn box')}</code></li>`).join('')}</ul>
+    </div>`;
+  }
+  $('#findings').innerHTML = html;
+  $('#markCount').textContent = state.findings.filter(f => f.enabled).length + ' active';
+}
+
+function refreshPages(nums) { new Set(nums).forEach(n => renderOverlay(state.pages[n - 1])); renderFindings(); }
+
+function scrollToFinding(id) {
+  const f = state.findings.find(x => x.id === id); if (!f) return;
+  const p = state.pages[f.page - 1], v = $('#viewer');
+  v.scrollTo({ top: p.wrap.offsetTop + f.rects[0].y * state.zoom - v.clientHeight / 3, behavior: 'smooth' });
+  setTimeout(() => p.overlay.querySelectorAll(`.mark[data-id="${id}"]`).forEach(el => {
+    el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+  }), 380);
+}
+
+function removeFinding(id) {
+  const i = state.findings.findIndex(f => f.id === id); if (i < 0) return;
+  const [f] = state.findings.splice(i, 1);
+  refreshPages([f.page]);
+}
+
+function undo() {
+  while (state.undo.length) {
+    const id = state.undo.pop();
+    if (state.findings.some(f => f.id === id)) { removeFinding(id); toast('Box removed.'); return; }
+  }
+  toast('Nothing to undo.');
+}
+
+/* =============================================================================
+   9. MANUAL DRAWING
+   Pointer position is taken relative to the overlay (same size as the page on
+   screen) and divided by zoom to get reference-space coordinates.
+   ========================================================================== */
+let drag = null;
+function dragRect(e) {
+  const x = Math.max(0, Math.min(drag.bounds.width, e.clientX - drag.bounds.left));
+  const y = Math.max(0, Math.min(drag.bounds.height, e.clientY - drag.bounds.top));
+  return { x: Math.min(x, drag.x0), y: Math.min(y, drag.y0), w: Math.abs(x - drag.x0), h: Math.abs(y - drag.y0) };
+}
+$('#pages').addEventListener('pointerdown', e => {
+  if (!state.drawMode || e.button !== 0) return;
+  const ov = e.target.closest('.overlay'); if (!ov) return;
+  e.preventDefault();
+  const bounds = ov.getBoundingClientRect();
+  const el = document.createElement('div'); el.className = 'drawing'; ov.appendChild(el);
+  drag = { ov, bounds, el, page: +ov.dataset.page, x0: e.clientX - bounds.left, y0: e.clientY - bounds.top };
+  ov.setPointerCapture(e.pointerId);
+});
+$('#pages').addEventListener('pointermove', e => {
+  if (!drag) return;
+  const r = dragRect(e);
+  Object.assign(drag.el.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
+});
+function endDrag(e, cancel) {
+  if (!drag) return;
+  const r = dragRect(e), d = drag; drag = null; d.el.remove();
+  if (cancel || r.w < 4 || r.h < 4) return;
+  const z = state.zoom;
+  const f = { id: state.nextId++, page: d.page, rects: [{ x: r.x / z, y: r.y / z, w: r.w / z, h: r.h / z }],
+              source: 'manual', cat: 'manual', text: '', enabled: true };
+  state.findings.push(f); state.undo.push(f.id);
+  refreshPages([d.page]);
+}
+$('#pages').addEventListener('pointerup', e => endDrag(e, false));
+$('#pages').addEventListener('pointercancel', e => endDrag(e, true));
+
+$('#pages').addEventListener('click', e => {
+  const del = e.target.closest('[data-del]');
+  if (del) { e.stopPropagation(); removeFinding(+del.dataset.del); return; }
+  const m = e.target.closest('.mark');
+  if (!m || state.drawMode) return;
+  const f = state.findings.find(x => x.id === +m.dataset.id); if (!f) return;
+  f.enabled = !f.enabled;
+  refreshPages([f.page]);
+});
+
+function setDraw(on) {
+  state.drawMode = on;
+  document.body.classList.toggle('draw', on);
+  $('#drawBtn').classList.toggle('active', on);
+}
+function setPreview(on) {
+  state.preview = on;
+  document.body.classList.toggle('preview', on);
+  $('#previewBtn').classList.toggle('active', on);
+}
+
+/* =============================================================================
+   10. EXPORT: permanent redaction
+   -----------------------------------------------------------------------------
+   For each page that is flattened:
+     1. Render with pdf.js at scale = dpi/72 (annotations and form values are
+        rendered too, so they are baked in rather than carried over).
+     2. Paint each rect in black at rect * scale. The render viewport and the
+        reference space differ only by that scale, so boxes land exactly.
+     3. Encode the canvas as JPEG/PNG and place it as the ONLY content of a new
+        page sized ref.width x ref.height points. The image fills the page from
+        (0,0), so no y-flip into PDF bottom-left space is needed.
+   Unmarked pages are either flattened as well (default) or copied unchanged.
+   (For vector redaction instead, viewport.convertToPdfPoint(x, y) converts
+   reference coords to PDF user space; but drawing a box over live text does
+   NOT remove the text, which is why this tool rasterises.)
+   ========================================================================== */
+async function exportPdf() {
+  if (!state.pdf || state.busy) return;
+  const active = state.findings.filter(f => f.enabled);
+  if (!active.length && !window.confirm('No marks are active. Export a flattened copy anyway?')) return;
+  setBusy(true);
+  const rep = $('#exportReport'); rep.hidden = true;
+  const prog = progress('#expProg');
+  const dpi = +$('#dpi').value, fmt = $('#fmt').value;
+  let rasterAll = $('#rasterAll').checked, note = '';
+  try {
+    let src = null;
+    if (!rasterAll) {
+      try { src = await PDFDocument.load(state.bytes, { updateMetadata: false }); }
+      catch (_) { rasterAll = true; note = 'The source is encrypted or not readable by pdf-lib, so every page was flattened. The output has no password.'; }
+    }
+    const out = await PDFDocument.create({ updateMetadata: false });
+    const byPage = new Map();
+    for (const f of active) { if (!byPage.has(f.page)) byPage.set(f.page, []); byPage.get(f.page).push(f); }
+    const flattened = []; let applied = 0;
+
+    for (let i = 1; i <= state.numPages; i++) {
+      const finds = byPage.get(i) || [];
+      if (!rasterAll && !finds.length) {
+        const [cp] = await out.copyPages(src, [i - 1]); out.addPage(cp);
+        prog.set(i / state.numPages); continue;
+      }
+      const page = await state.pdf.getPage(i);
+      const ref = page.getViewport({ scale: 1 });
+      let s = dpi / 72;
+      if (ref.width * ref.height * s * s > MAX_EXPORT_PX) s = Math.sqrt(MAX_EXPORT_PX / (ref.width * ref.height));
+      const vp = page.getViewport({ scale: s });
+      const c = document.createElement('canvas');
+      c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
+      const ctx = c.getContext('2d', { alpha: false });
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+      await page.render({ canvasContext: ctx, viewport: vp, annotationMode: pdfjsLib.AnnotationMode.ENABLE }).promise;
+
+      ctx.fillStyle = '#000';
+      for (const f of finds) for (const r of f.rects) {
+        // floor/ceil + 1px so anti-aliased glyph edges never peek out
+        ctx.fillRect(Math.floor(r.x * s), Math.floor(r.y * s), Math.ceil(r.w * s) + 1, Math.ceil(r.h * s) + 1);
+      }
+      applied += finds.length;
+
+      const blob = await new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error('Image encoding failed')),
+        fmt === 'png' ? 'image/png' : 'image/jpeg', 0.92));
+      const imgBytes = new Uint8Array(await blob.arrayBuffer());
+      const img = fmt === 'png' ? await out.embedPng(imgBytes) : await out.embedJpg(imgBytes);
+      const pg = out.addPage([ref.width, ref.height]);
+      pg.drawImage(img, { x: 0, y: 0, width: ref.width, height: ref.height });
+      c.width = c.height = 0;           // free bitmap memory
+      page.cleanup();
+      flattened.push(i);
+      prog.set(i / state.numPages);
+      await tick();
+    }
+
+    // Neutral metadata: nothing from the source (author, title, client name) survives.
+    const now = new Date();
+    out.setTitle('Redacted document'); out.setAuthor(''); out.setSubject(''); out.setKeywords([]);
+    out.setCreator('SecureRedact, vigneswaran C L'); out.setProducer('SecureRedact (client-side)');
+    out.setCreationDate(now); out.setModificationDate(now);
+    const bytes = await out.save({ useObjectStreams: true });
+
+    // Self-check: re-open the output and count extractable characters on flattened pages.
+    let leak = null;
+    if ($('#verify').checked) {
+      leak = 0;
+      const v = await pdfjsLib.getDocument({ ...PDF_OPTS, data: bytes.slice() }).promise;
+      for (const i of flattened) {
+        const tc = await (await v.getPage(i)).getTextContent();
+        for (const it of tc.items) if (it.str) leak += it.str.replace(/\s/g, '').length;
+      }
+      await v.destroy();
+    }
+
+    const base = state.fileName.replace(/\.pdf$/i, '');
+    download(bytes, `${base}_REDACTED.pdf`, 'application/pdf');
+    if ($('#log').checked) setTimeout(() => download(buildLog(active, flattened, dpi), `${base}_redaction-log.csv`, 'text/csv'), 500);
+
+    rep.className = 'report' + (leak ? ' warn' : '');
+    rep.innerHTML = `<strong>${leak ? 'Check the output' : 'Redacted PDF saved'}</strong><br>
+      ${state.numPages} pages, ${flattened.length} flattened, ${applied} marks burned in, ${fmtBytes(bytes.length)}.` +
+      (leak === null ? '' : leak ? `<br>${leak} extractable characters were found on flattened pages.` : '<br>Verified: no extractable text on flattened pages.') +
+      (!rasterAll ? '<br>Unmarked pages were copied unchanged, so their text is still selectable.' : '') +
+      (note ? `<br>${esc(note)}` : '');
+    rep.hidden = false;
+  } catch (e) {
+    console.error(e); toast('Export failed: ' + (e.message || e), 7000);
+  } finally { prog.done(); setBusy(false); }
+}
+
+function maskValue(t) {
+  if (!t) return '(drawn box)';
+  const s = t.replace(/\s/g, '');
+  if (s.length <= 4) return '*'.repeat(s.length);
+  return s.slice(0, 2) + '*'.repeat(Math.max(3, s.length - 4)) + s.slice(-2);
+}
+function buildLog(active, flattened, dpi) {
+  const q = v => `"${String(v).replace(/"/g, '""')}"`;
+  const rows = [['File', state.fileName], ['Generated', new Date().toLocaleString('en-IN')], ['Pages', state.numPages],
+    ['Flattened pages', flattened.join(' ')], ['Resolution (DPI)', dpi], [], ['Page', 'Category', 'Source', 'Masked value']];
+  active.slice().sort((a, b) => a.page - b.page).forEach(f => rows.push([f.page, CAT[f.cat].label, f.source, maskValue(f.text)]));
+  return '\ufeff' + rows.map(r => r.map(q).join(',')).join('\r\n');
+}
+
+/* =============================================================================
+   11. UI WIRING
+   ========================================================================== */
+$('#catGrid').innerHTML = CATEGORIES.map(c =>
+  `<label title="${esc(c.hint || '')}"><input type="checkbox" data-cat="${c.key}" checked><span class="sw" style="--c:${c.color}"></span>${esc(c.label)}</label>`).join('');
+$('#catGrid').addEventListener('change', e => { const k = e.target.dataset.cat; if (k) state.catOn[k] = e.target.checked; });
+
+function renderChips() {
+  $('#kwChips').innerHTML = state.keywords.map((k, i) =>
+    `<span class="chip"><span title="${esc(k)}">${esc(k)}</span><button data-kw="${i}" aria-label="Remove ${esc(k)}">×</button></span>`).join('');
+}
+function addKeyword() {
+  const parts = $('#kwInput').value.split(/[;\n]/).map(s => s.trim()).filter(Boolean);
+  let added = 0;
+  for (const v of parts) {
+    if (v.length < 2) continue;
+    if (state.keywords.some(k => k.toLowerCase() === v.toLowerCase())) continue;
+    state.keywords.push(v); added++;
+  }
+  $('#kwInput').value = '';
+  renderChips();
+  if (!added) toast('Enter a new term of at least 2 characters. Separate several with ;');
+  else if (state.pdf) toast('Term added. Run the scan to apply it.');
+}
+$('#kwAdd').addEventListener('click', addKeyword);
+$('#kwInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addKeyword(); } });
+$('#kwChips').addEventListener('click', e => {
+  const b = e.target.closest('[data-kw]'); if (!b) return;
+  state.keywords.splice(+b.dataset.kw, 1); renderChips();
+});
+
+$('#fileInput').addEventListener('change', e => { openFile(e.target.files[0]); e.target.value = ''; });
+[$('#dropZone'), $('#viewer')].forEach(el => {
+  el.addEventListener('dragover', e => { e.preventDefault(); $('#dropZone').classList.add('over'); });
+  el.addEventListener('dragleave', () => $('#dropZone').classList.remove('over'));
+  el.addEventListener('drop', e => {
+    e.preventDefault(); $('#dropZone').classList.remove('over');
+    if (!state.busy && e.dataTransfer.files[0]) openFile(e.dataTransfer.files[0]);
+  });
+});
+
+$('#findings').addEventListener('click', e => {
+  const go = e.target.closest('[data-goto]');
+  if (go) { scrollToFinding(+go.dataset.goto); return; }
+  const head = e.target.closest('[data-open]');
+  if (head && !e.target.closest('.switch')) {
+    const k = head.dataset.open;
+    state.openGroups.has(k) ? state.openGroups.delete(k) : state.openGroups.add(k);
+    head.parentElement.classList.toggle('open');
+  }
+});
+$('#findings').addEventListener('change', e => {
+  const t = e.target;
+  if (t.dataset.grp) {
+    const list = state.findings.filter(f => f.cat === t.dataset.grp);
+    list.forEach(f => { f.enabled = t.checked; });
+    refreshPages(list.map(f => f.page));
+  } else if (t.dataset.fid) {
+    const f = state.findings.find(x => x.id === +t.dataset.fid);
+    if (f) { f.enabled = t.checked; refreshPages([f.page]); }
+  }
+});
+
+$('#scanBtn').addEventListener('click', runScan);
+$('#exportBtn').addEventListener('click', exportPdf);
+$('#drawBtn').addEventListener('click', () => setDraw(!state.drawMode));
+$('#previewBtn').addEventListener('click', () => setPreview(!state.preview));
+$('#clearBtn').addEventListener('click', () => { closeDocument(); toast('Document closed and cleared from memory.'); });
+
+const ZOOMS = [0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+function setZoom(z) {
+  z = Math.max(0.4, Math.min(3, z));
+  if (!state.pdf || Math.abs(z - state.zoom) < 0.001) return;
+  const v = $('#viewer'), ratio = v.scrollTop / Math.max(1, v.scrollHeight);
+  state.zoom = z; layoutAll();
+  v.scrollTop = ratio * v.scrollHeight;
+}
+function zoomStep(dir) {
+  const z = state.zoom;
+  const next = dir > 0 ? ZOOMS.find(x => x > z + 0.001) : [...ZOOMS].reverse().find(x => x < z - 0.001);
+  if (next) setZoom(next);
+}
+$('#zoomIn').addEventListener('click', () => zoomStep(1));
+$('#zoomOut').addEventListener('click', () => zoomStep(-1));
+$('#fitBtn').addEventListener('click', () => setZoom(fitZoom()));
+
+document.addEventListener('keydown', e => {
+  if (e.target.matches('input, select, textarea') || !state.pdf) return;
+  const k = e.key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); undo(); }
+  else if (e.ctrlKey || e.metaKey || e.altKey) return;
+  else if (k === 'd') setDraw(!state.drawMode);
+  else if (k === 'p') setPreview(!state.preview);
+  else if (k === 'escape') setDraw(false);
+  else if (k === '+' || k === '=') zoomStep(1);
+  else if (k === '-') zoomStep(-1);
+});
+
+renderFindings();
+updateControls();
+})();
+</script>
+</body>
+</html>
